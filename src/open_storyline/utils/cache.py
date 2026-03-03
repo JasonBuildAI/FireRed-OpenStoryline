@@ -191,7 +191,7 @@ class NodeCacheBackend:
             temp_file = self.index_file.with_suffix(".tmp")
             with temp_file.open("w", encoding="utf-8") as f:
                 json.dump(self.index, f, ensure_ascii=False, indent=2)
-            temp_file.rename(self.index_file)
+            temp_file.replace(self.index_file)
         except IOError as e:
             logger.error(f"Failed to save cache index: {e}")
     
@@ -267,7 +267,7 @@ class NodeCacheBackend:
             with cache_file.open("r", encoding="utf-8") as f:
                 result = json.load(f)
             
-            logger.info(f"Cache hit: {key.node_id}")
+            logger.info(f"Cache hit: {key.node_id} (config_version={key.config_version}, key={key_str[:32]}...)")
             return result
             
         except json.JSONDecodeError as e:
@@ -282,23 +282,27 @@ class NodeCacheBackend:
         """保存缓存"""
         if not self.policy.enabled:
             return False
-        
+
         if key.node_id in self.policy.exclude_nodes:
             return False
-        
+
+        temp_file = None
         try:
             if not self._check_size_limit(key.node_id):
                 self._cleanup()
-            
+
             cache_filename = key.to_filename()
             cache_file = self.cache_dir / cache_filename
             temp_file = cache_file.with_suffix(".tmp")
-            
+
             with temp_file.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            temp_file.rename(cache_file)
-            
+
+            # 原子替换缓存文件
+            temp_file.replace(cache_file)
+            temp_file = None  # 标记为已处理，避免 finally 中误删
+
+            # 更新索引
             key_str = str(key)
             self.index[key_str] = {
                 "file": cache_filename,
@@ -307,13 +311,20 @@ class NodeCacheBackend:
                 "node_id": key.node_id
             }
             self._save_index()
-            
-            logger.info(f"Cache saved: {key.node_id}")
+
+            logger.info(f"Cache saved: {key.node_id} (config_version={key.config_version}, key={key_str[:32]}...)")
             return True
-            
+
         except (IOError, TypeError, ValueError) as e:
             logger.error(f"Failed to save cache: {e}")
             return False
+        finally:
+            # 清理临时文件（如果替换失败）
+            if temp_file is not None and temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except IOError:
+                    pass
     
     def _check_size_limit(self, node_id: str) -> bool:
         """检查是否超过大小限制"""
@@ -423,7 +434,11 @@ class CacheManager:
                 return None
             
             if cache_config.cache_dir:
-                cache_dir = cache_config.cache_dir
+                cache_dir = Path(cache_config.cache_dir)
+                # 处理空字符串或当前目录的情况
+                if not cache_dir or str(cache_dir) == "." or str(cache_dir) == "":
+                    outputs_dir = getattr(cfg.project, 'outputs_dir', Path('./outputs'))
+                    cache_dir = Path(outputs_dir) / ".cache"
             else:
                 outputs_dir = getattr(cfg.project, 'outputs_dir', Path('./outputs'))
                 cache_dir = Path(outputs_dir) / ".cache"

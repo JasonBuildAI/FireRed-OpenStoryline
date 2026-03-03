@@ -380,6 +380,24 @@ class ToolInterceptor:
         return await handler(request)
     
     @staticmethod
+    def _normalize_tool_name(name: str) -> str:
+        """
+        规范化工具名称，去除 server 前缀。
+        
+        例如：
+        - "storyline_search_media" -> "search_media"
+        - "search_media" -> "search_media"
+        """
+        if not name:
+            return ""
+        # 常见的 server 前缀
+        prefixes = ["storyline_", "mcp_", "server_"]
+        for prefix in prefixes:
+            if name.startswith(prefix):
+                return name[len(prefix):]
+        return name
+
+    @staticmethod
     async def cache_node_result(request: MCPToolCallRequest, handler):
         """
         Interceptor: Cache node execution results based on input parameters.
@@ -395,7 +413,8 @@ class ToolInterceptor:
         if not cache_backend:
             return await handler(request)
         
-        node_id = str(getattr(request, "name", "") or "")
+        raw_node_id = str(getattr(request, "name", "") or "")
+        node_id = ToolInterceptor._normalize_tool_name(raw_node_id)
         args = getattr(request, "args", None)
         
         if not isinstance(args, dict):
@@ -425,10 +444,13 @@ class ToolInterceptor:
         if cached_result is not None:
             tool_call_id = getattr(request.runtime, "tool_call_id", None) if runtime else None
             
+            # 将 dict 序列化为 JSON 字符串，确保 ToolMessage content 类型正确
+            content_str = json.dumps(cached_result, ensure_ascii=False)
+            
             return Command(
                 update={
                     "messages": [
-                        ToolMessage(content=cached_result, tool_call_id=tool_call_id)
+                        ToolMessage(content=content_str, tool_call_id=tool_call_id)
                     ],
                     "status": "done"
                 },
