@@ -20,7 +20,7 @@ from open_storyline.skills.skills_io import load_skills
 
 logger = logging.getLogger(__name__)
 
-async def validate_api_key(base_url: str, api_key: str, model: str, provider: str = "LLM") -> bool:
+async def validate_api_key(base_url: str, api_key: str, model: str, provider: str = "LLM", timeout: float = 10.0) -> bool:
     """
     Validate API key by sending a direct HTTP request to the OpenAI-compatible API.
     
@@ -43,15 +43,25 @@ async def validate_api_key(base_url: str, api_key: str, model: str, provider: st
     }
     
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
-                f"{base_url}/v1/chat/completions",
+                f"{base_url}/chat/completions",
                 headers=headers,
                 json=payload,
             )
             
             if response.status_code == 200:
-                return True
+                try:
+                    data = response.json()
+                except Exception:
+                    raise ValueError(f"{provider} returned non-JSON response. Check base_url/gateway.")
+                choices = data.get("choices")
+                if isinstance(choices, list) and len(choices) > 0:
+                    return True
+                raise ValueError(
+                    f"{provider} returned a non-OpenAI-compatible response for chat.completions. "
+                    f"Please check gateway behavior, base_url routing, or auth configuration."
+                )
             
             # Handle specific HTTP status codes
             if response.status_code in (401, 403):
@@ -156,7 +166,7 @@ async def build_agent(
     llm_max_retries = _get(llm_override, "max_retries", cfg.llm.max_retries)
 
     # Validate LLM API key before creating the model
-    await validate_api_key(llm_base_url, llm_api_key, llm_model, "LLM")
+    await validate_api_key(llm_base_url, llm_api_key, llm_model, "LLM", llm_timeout)
 
     llm = ChatOpenAI(
         model=llm_model,
@@ -181,7 +191,7 @@ async def build_agent(
     vlm_max_retries = _get(vlm_override, "max_retries", cfg.vlm.max_retries)
 
     # Validate VLM API key before creating the model
-    await validate_api_key(vlm_base_url, vlm_api_key, vlm_model, "VLM")
+    await validate_api_key(vlm_base_url, vlm_api_key, vlm_model, "VLM", vlm_timeout)
 
     vlm = ChatOpenAI(
         model=vlm_model,
