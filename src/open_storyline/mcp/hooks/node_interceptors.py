@@ -19,23 +19,35 @@ from open_storyline.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-def compress_payload_to_base64(payload: Dict[str,List[Any]]):
+
+def should_inline_media_as_base64(server_cfg=None) -> bool:
+    """
+    Whether to inline media as base64 in MCP requests.
+    Returns False for local deployment (Agent and MCP server on same machine) to avoid
+    oversized HTTP payloads. Set to True when supporting remote MCP in the future.
+    """
+    return False
+
+
+def compress_payload_to_base64(payload: Dict[str, List[Any]], server_cfg=None):
+    """Convert path-only items to base64 when in remote MCP mode. No-op for local mode."""
     if not isinstance(payload, dict):
         return payload
-    for key,value in payload.items():
+    if not should_inline_media_as_base64(server_cfg):
+        return payload
+    for key, value in payload.items():
         if isinstance(value, list) and all([isinstance(item, dict) for item in value]):
             for item in value:
                 if 'path' in item.keys():
                     path = item['path']
                     compress_data = FileCompressor.compress_and_encode(path)
-
                     item.update({
                         "path": path,
                         "base64": compress_data.base64,
                         "md5": compress_data.md5
                     })
         elif isinstance(value, dict):
-            compress_payload_to_base64(value)
+            compress_payload_to_base64(value, server_cfg)
 
 class ToolInterceptor:
     
@@ -60,11 +72,14 @@ class ToolInterceptor:
             meta_collector: NodeManager = context.node_manager
             input_data = defaultdict(list)
 
+            server_cfg = getattr(context, "cfg", None) or getattr(context, "server_cfg", None)
+            inline_base64 = should_inline_media_as_base64(server_cfg)
+
             def load_collected_data(collected_node, input_data, store):
                 """Load collected node data"""
                 for collect_kind, artifact_meta in collected_node.items():
                     _, prior_node_output = store.load_result(artifact_meta.artifact_id)
-                    compress_payload_to_base64(prior_node_output['payload'])
+                    compress_payload_to_base64(prior_node_output['payload'], server_cfg)
                     input_data[collect_kind] = prior_node_output['payload']
 
             if node_id == 'load_media':
@@ -74,14 +89,27 @@ class ToolInterceptor:
                     path = media_dir / file_name
                     if path.is_dir():
                         continue
-                    compress_data = FileCompressor.compress_and_encode(path)
-                    input_data['inputs'].append(
-                        {
-                            "path": str(path.relative_to(os.getcwd())),
+                    if inline_base64:
+                        rel_path = str(path.relative_to(os.getcwd()))
+                        compress_data = FileCompressor.compress_and_encode(path)
+                        input_data['inputs'].append({
+                            "path": rel_path,
                             "base64": compress_data.base64,
                             "md5": compress_data.md5,
-                        }
-                    )
+                        })
+                    else:
+                        # Path-only (local): path relative to media_dir so MCP can resolve without depending on cwd
+                        media_root = Path(context.media_dir).resolve()
+                        try:
+                            rel_path = str(path.resolve().relative_to(media_root))
+                        except ValueError:
+                            # e.g. symlink outside media_dir; fallback to absolute path
+                            rel_path = str(path.resolve())
+                        input_data['inputs'].append({
+                            "path": rel_path,
+                            "orig_path": rel_path,
+                            "orig_md5": None,
+                        })
             elif node_id in list(meta_collector.id_to_tool.keys()):
                 # 1. Determine execution mode and dependency requirements
                 is_skip_mode = request.args.get('mode', 'auto') != 'auto'
