@@ -13,6 +13,7 @@ from open_storyline.nodes.node_state import NodeState
 from open_storyline.storage.file import FileCompressor
 from open_storyline.utils.logging import get_logger
 from open_storyline.mcp.sampling_requester import LLMClient
+from open_storyline.mcp.hooks.node_interceptors import should_inline_media_as_base64
 
 logger = get_logger(__name__)
 
@@ -84,7 +85,9 @@ class BaseNode(ABC):
             new_item['orig_path'] = str(item_path)
             new_item['orig_md5'] = item_md5
         elif item_path:
-            # Path-only mode (local MCP): path is relative to media_dir; resolve without depending on cwd
+            # Path-only mode (local MCP):
+            # - if item_path is absolute, accept it directly;
+            # - if item_path is relative, resolve it under media_dir and ensure it does not escape that directory.
             if os.path.isabs(item_path):
                 full_path = Path(item_path)
             else:
@@ -93,7 +96,9 @@ class BaseNode(ABC):
                 try:
                     full_path.relative_to(media_root)
                 except ValueError:
-                    raise ValueError(f"path-only path must be under media_dir: {item_path!r}")
+                    raise ValueError(
+                        f"relative path-only input must be under media_dir: {item_path!r}"
+                    )
             new_item['path'] = str(full_path)
             new_item['orig_path'] = str(item_path)
             new_item['orig_md5'] = item_md5
@@ -103,21 +108,51 @@ class BaseNode(ABC):
         orig_path = item.pop('orig_path', None)
         orig_md5 = item.pop('orig_md5', None)
         server_save_path = item.pop('path', None)
-        if server_save_path:
-            # Path-only mode: orig_path set and orig_md5 None means we received path-only, return as-is
-            if orig_path and orig_md5 is None:
-                node_state.node_summary.debug_for_dev(f"[node] node_id: {self.meta.node_id} return `path` only (local mode)")
-                item['path'] = orig_path
-                return item
-            compress_data = FileCompressor.compress_and_encode(server_save_path)
-            if orig_path and orig_md5 and compress_data.md5 == orig_md5:
-                node_state.node_summary.debug_for_dev(f"[node] node_id: {self.meta.node_id} change `path` change to {orig_path}")
-                item['path'] = orig_path
-            elif orig_md5 is None or compress_data.md5 != orig_md5:
-                node_state.node_summary.debug_for_dev(f"[node] node_id: {self.meta.node_id} return `base64` to client")
-                item['base64'] = compress_data.base64
-                item['path'] = compress_data.filename
-                item['md5'] = compress_data.md5
+        if not server_save_path:
+            return item
+
+        # Decide response transport policy (path-only vs base64) using the same policy
+        # function as the client side.
+        inline_base64 = should_inline_media_as_base64(self.server_cfg)
+
+        # Prefer a media_dir-relative path for responses when possible, with absolute
+        # path as a fallback. orig_path, if present, is treated as the preferred
+        # client-visible path but does not control the transport mode.
+        client_path = orig_path or server_save_path
+        try:
+            media_root = Path(self.server_cfg.project.media_dir).resolve()
+        except Exception:
+            media_root = None
+        if media_root is not None:
+            try:
+                client_rel = Path(server_save_path).resolve().relative_to(media_root)
+                client_path = str(client_rel)
+            except Exception:
+                client_path = str(client_path)
+        else:
+            client_path = str(client_path)
+
+        if not inline_base64:
+            node_state.node_summary.debug_for_dev(
+                f"[node] node_id: {self.meta.node_id} return `path` only (local mode)"
+            )
+            item['path'] = client_path
+            return item
+
+        # Remote / base64 mode: keep existing md5-based optimisation when possible.
+        compress_data = FileCompressor.compress_and_encode(server_save_path)
+        if orig_path and orig_md5 and compress_data.md5 == orig_md5:
+            node_state.node_summary.debug_for_dev(
+                f"[node] node_id: {self.meta.node_id} change `path` change to {orig_path}"
+            )
+            item['path'] = orig_path
+        else:
+            node_state.node_summary.debug_for_dev(
+                f"[node] node_id: {self.meta.node_id} return `base64` to client"
+            )
+            item['base64'] = compress_data.base64
+            item['path'] = compress_data.filename
+            item['md5'] = compress_data.md5
         return item
 
 
