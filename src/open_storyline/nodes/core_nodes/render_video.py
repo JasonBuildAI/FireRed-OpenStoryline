@@ -691,9 +691,24 @@ class RenderVideoPipeline:
     def __init__(self, *, server_cache_dir: Path, font_info_path: Path) -> None:
         self._server_cache_dir = server_cache_dir
         self.font_info_path = font_info_path
-        with open(font_info_path, encoding='utf-8') as f:
-            self.font_info = json.load(f)
-        self._fontname2path = {font['font_name']: font['font_path'] for font in self.font_info}
+        # 字体信息是可选的：如果配置文件不存在或解析失败，不应该导致整个渲染节点报错
+        self.font_info = []
+        self._fontname2path: dict[str, str] = {}
+        try:
+            if font_info_path and font_info_path.exists():
+                with open(font_info_path, encoding="utf-8") as f:
+                    data = json.load(f) or []
+                if isinstance(data, list):
+                    self.font_info = data
+                    self._fontname2path = {
+                        str(font.get("font_name") or ""): str(font.get("font_path") or "")
+                        for font in data
+                        if font.get("font_name") and font.get("font_path")
+                    }
+        except Exception:
+            # 静默降级：没有可用字体信息时，后续会退回到 Pillow 默认字体
+            self.font_info = []
+            self._fontname2path = {}
 
     async def render(self, *, node_state: NodeState, inputs: Dict[str, Any]) -> Dict[str, Any]:
         load_media: Dict[str, Any] = inputs["load_media"]

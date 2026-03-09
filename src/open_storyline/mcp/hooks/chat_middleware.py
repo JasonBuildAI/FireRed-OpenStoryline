@@ -159,18 +159,34 @@ async def log_tool_request(request, handler):
         else:
             if is_mcp_tool:
                 if additional_kwargs.get("mcp_raw_text") is True:
-                    # mcp success
+                    # mcp success，content 已经是原始文本
                     isError = False
                     summary = getattr(out, "content", "")
                 else:
-                    # judge based on out.content.isError
-                    out_json = ast.literal_eval(out.content)
-                    isError = out_json.get("isError", False)
+                    # content 可能是 JSON 字符串，也可能已经是 dict（如经过 ToolInterceptor 包装）
+                    raw_content = getattr(out, "content", None)
+                    out_json = None
 
-                    if not isError:
-                        summary = out_json.get("summary", {}).get("node_summary", "")
-                    else:
-                        summary = _mask_secrets(out.content)
+                    if isinstance(raw_content, dict):
+                        out_json = raw_content
+                    elif isinstance(raw_content, str):
+                        try:
+                            out_json = ast.literal_eval(raw_content)
+                        except Exception:
+                            # 内容不是合法的 Python 字面量，直接按错误处理并把原始内容脱敏
+                            isError = True
+                            summary = _mask_secrets(raw_content)
+
+                    if out_json is not None and not isError:
+                        isError = bool(out_json.get("isError", False))
+                        if not isError:
+                            summary_dict = out_json.get("summary") or {}
+                            if isinstance(summary_dict, dict):
+                                summary = summary_dict.get("node_summary", "")
+                            else:
+                                summary = summary_dict
+                        else:
+                            summary = _mask_secrets(out_json)
 
             # Skill tool success
             # it don't provide "isError" field
