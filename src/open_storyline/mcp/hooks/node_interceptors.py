@@ -105,6 +105,7 @@ class ToolInterceptor:
 
             if node_id == 'load_media':
                 input_data['inputs'] = []
+                seen_paths: set = set()
                 media_dir = Path(context.media_dir)
                 for file_name in os.listdir(media_dir):
                     path = media_dir / file_name
@@ -126,11 +127,32 @@ class ToolInterceptor:
                         except ValueError:
                             # e.g. symlink outside media_dir; fallback to absolute path
                             rel_path = str(path.resolve())
-                        input_data['inputs'].append({
-                            "path": rel_path,
-                            "orig_path": rel_path,
-                            "orig_md5": None,
-                        })
+                        if rel_path not in seen_paths:
+                            seen_paths.add(rel_path)
+                            input_data['inputs'].append({
+                                "path": rel_path,
+                                "orig_path": rel_path,
+                                "orig_md5": None,
+                            })
+                # Path-only mode: include auto-searched media from .storyline/.server_cache so they are readable
+                if not inline_base64:
+                    latest_search = store.get_latest_meta(node_id='search_media', session_id=session_id)
+                    if latest_search:
+                        _, data = store.load_result(latest_search.artifact_id)
+                        if isinstance(data, dict):
+                            paths = data.get('payload', {}).get('search_media') or []
+                            for p in paths:
+                                if not p or not isinstance(p, str):
+                                    continue
+                                norm = str(Path(p).resolve()) if not os.path.isabs(p) else p
+                                if norm in seen_paths:
+                                    continue
+                                seen_paths.add(norm)
+                                input_data['inputs'].append({
+                                    "path": p,
+                                    "orig_path": p,
+                                    "orig_md5": None,
+                                })
             elif node_id in list(meta_collector.id_to_tool.keys()):
                 # 1. Determine execution mode and dependency requirements
                 is_skip_mode = request.args.get('mode', 'auto') != 'auto'
