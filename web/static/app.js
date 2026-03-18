@@ -3176,7 +3176,6 @@ class App {
     return { mode, api_key };
   }
 
-
   _makeChatSendPayload(text, attachment_ids) {
     const payload = { text, attachment_ids, lang: this.lang || "zh" };
 
