@@ -1328,6 +1328,11 @@ class ChatSession:
         self._media_seq_inited = False
         self._media_seq_next = 1
 
+        # Restore diagnostics (not persisted). When recovery detects corrupt tool rows,
+        # we "fail-closed" by truncating lc_messages from the impacted tool-use turn.
+        self.restore_degraded: bool = False
+        self.restore_degraded_reason: str = ""
+
     @classmethod
     def state_file_path_for(cls, session_id: str, cfg: Settings) -> str:
         return os.path.abspath(os.path.join(str(cfg.project.outputs_dir), session_id, SESSION_STATE_FILENAME))
@@ -1376,6 +1381,80 @@ class ChatSession:
         if cfg_obj is None:
             return None
         return _mask_secrets_recursive(_to_json_safe(cfg_obj))
+
+    @staticmethod
+    def _sanitize_custom_model_cfg_for_state(cfg_obj: Any) -> Optional[Dict[str, Any]]:
+        """
+        Primary boundary for persistence: never serialize raw API keys for custom models.
+        Only keep {model, base_url, api_key="***"} and drop everything else.
+        """
+        if not isinstance(cfg_obj, dict) or not cfg_obj:
+            return None
+        model = _s(cfg_obj.get("model"))
+        base_url = _norm_url(cfg_obj.get("base_url"))
+        api_key_present = _s(cfg_obj.get("api_key"))
+        out: Dict[str, Any] = {"model": model, "base_url": base_url}
+        if api_key_present or any(_is_secret_field_name(str(k)) for k in cfg_obj.keys()):
+            out["api_key"] = MASKED_SECRET
+        return out
+
+    @staticmethod
+    def _sanitize_tts_cfg_for_state(tts_cfg: Any) -> Dict[str, Any]:
+        """
+        Primary boundary for persistence: keep TTS structure but redact secret fields by key name.
+        Regex-based masking still applies as a secondary fallback for string payloads.
+        """
+        if not isinstance(tts_cfg, dict) or not tts_cfg:
+            return {}
+        safe = _mask_secrets_recursive(_to_json_safe(tts_cfg))
+        return safe if isinstance(safe, dict) else {}
+
+    def _fail_closed_truncate_lc_messages(self, truncate_at: int, reason: str) -> None:
+        truncate_at = int(max(0, truncate_at))
+        msgs = [m for m in (self.lc_messages or []) if isinstance(m, BaseMessage)]
+        if truncate_at < len(msgs):
+            self.lc_messages = msgs[:truncate_at]
+        self.restore_degraded = True
+        self.restore_degraded_reason = (reason or "degraded_restore").strip()
+
+    def _validate_tool_protocol_and_fail_closed(self) -> None:
+        """
+        Validate tool-call pairing on restored lc_messages and fail-closed on corruption.
+        We do NOT try to invent a ToolMessage for missing tool_call_id; instead we truncate
+        to the last clean boundary to avoid feeding semantically corrupted tool results to the LLM.
+        """
+        msgs: List[BaseMessage] = [m for m in (self.lc_messages or []) if isinstance(m, BaseMessage)]
+        pending_ids: Set[str] = set()
+        responded_ids: Set[str] = set()
+        tool_turn_start_idx: Optional[int] = None
+
+        for idx, m in enumerate(msgs):
+            if isinstance(m, AIMessage):
+                pending_ids = _tool_call_ids_from_ai_message_for_state(m)
+                responded_ids = set()
+                tool_turn_start_idx = idx if pending_ids else None
+                continue
+
+            if isinstance(m, ToolMessage):
+                tcid = str(getattr(m, "tool_call_id", "") or "").strip()
+                if not tcid:
+                    self._fail_closed_truncate_lc_messages(
+                        tool_turn_start_idx if tool_turn_start_idx is not None else idx,
+                        "degraded_restore: empty tool_call_id",
+                    )
+                    return
+                if (not pending_ids) or (tcid not in pending_ids) or (tcid in responded_ids):
+                    self._fail_closed_truncate_lc_messages(
+                        tool_turn_start_idx if tool_turn_start_idx is not None else idx,
+                        "degraded_restore: tool protocol mismatch",
+                    )
+                    return
+                responded_ids.add(tcid)
+                continue
+
+            pending_ids = set()
+            responded_ids = set()
+            tool_turn_start_idx = None
 
     @staticmethod
     def _normalized_lc_messages_for_state(messages: List[BaseMessage], lang: str) -> List[BaseMessage]:
@@ -1457,9 +1536,10 @@ class ChatSession:
             "pending_media_ids": [str(x) for x in (self.pending_media_ids or [])],
             "lc_messages_serialized": self._serialize_lc_messages(),
             "pexels_key_mode": self.pexels_key_mode,
-            "custom_llm_config": self._sanitize_service_cfg_for_state(self.custom_llm_config),
-            "custom_vlm_config": self._sanitize_service_cfg_for_state(self.custom_vlm_config),
-            "tts_config": self._sanitize_service_cfg_for_state(self.tts_config),
+            # Primary boundary: never persist raw API keys for configs.
+            "custom_llm_config": self._sanitize_custom_model_cfg_for_state(self.custom_llm_config),
+            "custom_vlm_config": self._sanitize_custom_model_cfg_for_state(self.custom_vlm_config),
+            "tts_config": self._sanitize_tts_cfg_for_state(self.tts_config),
         }
 
     def save_state_atomic(self) -> None:
@@ -1643,16 +1723,30 @@ class ChatSession:
 
         lc_msgs_raw = data.get("lc_messages_serialized") or []
         lc_msgs: List[BaseMessage] = []
+        truncate_at: Optional[int] = None
+        truncate_reason: str = ""
+        last_tool_ai_idx: Optional[int] = None
         if isinstance(lc_msgs_raw, list):
             for item in lc_msgs_raw:
                 try:
+                    if isinstance(item, dict) and str(item.get("type") or "").strip().lower() == "tool":
+                        tcid_raw = str(item.get("tool_call_id") or "").strip()
+                        if not tcid_raw:
+                            truncate_at = last_tool_ai_idx if last_tool_ai_idx is not None else len(lc_msgs)
+                            truncate_reason = "degraded_restore: corrupt tool row (missing tool_call_id)"
+                            break
                     msg = _deserialize_lc_message(item)
                     if msg is not None:
+                        if isinstance(msg, AIMessage) and _tool_call_ids_from_ai_message_for_state(msg):
+                            last_tool_ai_idx = len(lc_msgs)
                         lc_msgs.append(msg)
                 except Exception:
                     continue
         sess.lc_messages = lc_msgs
         sess._ensure_lc_messages_invariants()
+        if truncate_at is not None:
+            sess._fail_closed_truncate_lc_messages(truncate_at, truncate_reason)
+            sess._ensure_lc_messages_invariants()
 
         sess.pexels_key_mode = str(data.get("pexels_key_mode") or "default").strip().lower()
         if sess.pexels_key_mode not in ("default", "custom"):
@@ -1667,6 +1761,8 @@ class ChatSession:
         sess.tts_config = tts_cfg if isinstance(tts_cfg, dict) else {}
 
         sess._normalize_running_tool_records()
+        sess._validate_tool_protocol_and_fail_closed()
+        sess._ensure_lc_messages_invariants()
         sess._close_unfinished_tool_calls_in_lc_messages()
         sess._sanitize_tool_protocol_in_lc_messages()
         sess._rebuild_tool_history_index()
@@ -1930,6 +2026,8 @@ class ChatSession:
             "pending_media": self.public_pending_media(),
             "history": self.history,
             "turn_running": self.chat_lock.locked(),
+            "restore_degraded": bool(getattr(self, "restore_degraded", False)),
+            "restore_degraded_reason": str(getattr(self, "restore_degraded_reason", "") or ""),
             "limits": {
                 "max_upload_files_per_request": MAX_UPLOAD_FILES_PER_REQUEST,
                 "max_media_per_session": MAX_MEDIA_PER_SESSION,
