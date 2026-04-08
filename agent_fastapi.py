@@ -1457,36 +1457,60 @@ class ChatSession:
             tool_turn_start_idx = None
 
     @staticmethod
-    def _normalized_lc_messages_for_state(messages: List[BaseMessage], lang: str) -> List[BaseMessage]:
+    def _apply_instruction_and_upload_headers(messages: List[BaseMessage], lang: str) -> List[BaseMessage]:
+        """
+        Single source of truth for lc_messages header invariants:
+        index 0 = instruction prompt for `lang`, index 1 = upload-status system message.
+        Strips any prior zh/en instruction prompts and re-hoists the first upload-status row
+        so language switches cannot leave duplicate instruction system messages in history.
+        """
         instruction_sys = get_prompt("instruction.system", lang=lang)
+        zh_ins = str(get_prompt("instruction.system", lang="zh")).strip()
+        en_ins = str(get_prompt("instruction.system", lang="en")).strip()
         upload_placeholder = UPLOAD_STATUS_SYSTEM_EMPTY
-        msgs: List[BaseMessage] = [m for m in (messages or []) if isinstance(m, BaseMessage)]
 
-        if not msgs:
-            return [SystemMessage(content=instruction_sys), SystemMessage(content=upload_placeholder)]
+        body: List[BaseMessage] = []
+        upload_msg: Optional[SystemMessage] = None
 
-        if not isinstance(msgs[0], SystemMessage) or str(getattr(msgs[0], "content", "")).strip() != str(instruction_sys).strip():
-            msgs.insert(0, SystemMessage(content=instruction_sys))
+        for m in messages or []:
+            if not isinstance(m, BaseMessage):
+                continue
+            if isinstance(m, SystemMessage):
+                c = str(getattr(m, "content", "")).strip()
+                if c == zh_ins or c == en_ins:
+                    continue
+                if c.startswith(UPLOAD_STATUS_SYSTEM_PREFIX):
+                    if upload_msg is None:
+                        upload_msg = m
+                    continue
+            body.append(m)
 
-        def _is_upload_stats_msg(m: BaseMessage) -> bool:
-            if not isinstance(m, SystemMessage):
-                return False
-            return str(getattr(m, "content", "")).strip().startswith(UPLOAD_STATUS_SYSTEM_PREFIX)
+        if upload_msg is None:
+            upload_msg = SystemMessage(content=upload_placeholder)
 
-        if len(msgs) == 1:
-            msgs.append(SystemMessage(content=upload_placeholder))
-        elif not _is_upload_stats_msg(msgs[1]):
-            found_idx = None
-            for i in range(2, len(msgs)):
-                if _is_upload_stats_msg(msgs[i]):
-                    found_idx = i
-                    break
-            if found_idx is not None:
-                m = msgs.pop(found_idx)
-                msgs.insert(1, m)
-            else:
-                msgs.insert(1, SystemMessage(content=upload_placeholder))
-        return msgs
+        return [SystemMessage(content=instruction_sys), upload_msg, *body]
+
+    @staticmethod
+    def _normalized_lc_messages_for_state(messages: List[BaseMessage], lang: str) -> List[BaseMessage]:
+        msgs = [m for m in (messages or []) if isinstance(m, BaseMessage)]
+        return ChatSession._apply_instruction_and_upload_headers(msgs, lang)
+
+    @staticmethod
+    def _safe_body_suffix_for_state(body: List[BaseMessage], budget: int) -> List[BaseMessage]:
+        """
+        Keep at most `budget` tail messages without starting at an orphan ToolMessage
+        (tool-turn left edge). Prefer preserving a shorter valid suffix over a longer invalid one.
+        """
+        n = len(body)
+        if budget <= 0 or n == 0:
+            return []
+        max_take = min(budget, n)
+        for take in range(max_take, 0, -1):
+            i = n - take
+            if isinstance(body[i], ToolMessage):
+                continue
+            return body[i:]
+        return []
 
     def _persist_history(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -1505,16 +1529,21 @@ class ChatSession:
 
     def _serialize_lc_messages(self) -> List[Dict[str, Any]]:
         msgs = self._normalized_lc_messages_for_state(list(self.lc_messages or []), self.lang)
-        if SESSION_STATE_MAX_LC_MESSAGES > 0 and len(msgs) > SESSION_STATE_MAX_LC_MESSAGES:
-            msgs = msgs[-SESSION_STATE_MAX_LC_MESSAGES:]
-            msgs = self._normalized_lc_messages_for_state(msgs, self.lang)
-            if len(msgs) > SESSION_STATE_MAX_LC_MESSAGES:
-                if SESSION_STATE_MAX_LC_MESSAGES <= 2:
-                    msgs = msgs[:SESSION_STATE_MAX_LC_MESSAGES]
+        cap = SESSION_STATE_MAX_LC_MESSAGES
+        if cap > 0 and len(msgs) > cap:
+            if cap <= 2:
+                msgs = msgs[:cap]
+            else:
+                head2 = msgs[:2]
+                tail = ChatSession._safe_body_suffix_for_state(msgs[2:], cap - 2)
+                msgs = self._normalized_lc_messages_for_state(head2 + tail, self.lang)
+            if len(msgs) > cap:
+                if cap <= 2:
+                    msgs = msgs[:cap]
                 else:
-                    # Keep invariant-critical first 2 system messages, trim tail payload.
-                    keep_tail = SESSION_STATE_MAX_LC_MESSAGES - 2
-                    msgs = msgs[:2] + msgs[-keep_tail:]
+                    head2 = msgs[:2]
+                    tail = ChatSession._safe_body_suffix_for_state(msgs[2:], cap - 2)
+                    msgs = self._normalized_lc_messages_for_state(head2 + tail, self.lang)
 
         out: List[Dict[str, Any]] = []
         for m in msgs:
@@ -1536,6 +1565,7 @@ class ChatSession:
             "pending_media_ids": [str(x) for x in (self.pending_media_ids or [])],
             "lc_messages_serialized": self._serialize_lc_messages(),
             "pexels_key_mode": self.pexels_key_mode,
+            "sent_media_total": int(getattr(self, "sent_media_total", 0) or 0),
             # Primary boundary: never persist raw API keys for configs.
             "custom_llm_config": self._sanitize_custom_model_cfg_for_state(self.custom_llm_config),
             "custom_vlm_config": self._sanitize_custom_model_cfg_for_state(self.custom_vlm_config),
@@ -1552,39 +1582,8 @@ class ChatSession:
         os.replace(tmp, path)
 
     def _ensure_lc_messages_invariants(self) -> None:
-        instruction_sys = get_prompt("instruction.system", lang=self.lang)
-        upload_placeholder = UPLOAD_STATUS_SYSTEM_EMPTY
-        msgs: List[BaseMessage] = [m for m in (self.lc_messages or []) if isinstance(m, BaseMessage)]
-
-        if not msgs:
-            msgs = [SystemMessage(content=instruction_sys), SystemMessage(content=upload_placeholder)]
-            self.lc_messages = msgs
-            self._attach_stats_msg_idx = 1
-            return
-
-        if not isinstance(msgs[0], SystemMessage) or str(getattr(msgs[0], "content", "")).strip() != str(instruction_sys).strip():
-            msgs.insert(0, SystemMessage(content=instruction_sys))
-
-        def _is_upload_stats_msg(m: BaseMessage) -> bool:
-            if not isinstance(m, SystemMessage):
-                return False
-            return str(getattr(m, "content", "")).strip().startswith(UPLOAD_STATUS_SYSTEM_PREFIX)
-
-        if len(msgs) <= 1:
-            msgs.append(SystemMessage(content=upload_placeholder))
-        elif not _is_upload_stats_msg(msgs[1]):
-            found_idx = None
-            for i in range(2, len(msgs)):
-                if _is_upload_stats_msg(msgs[i]):
-                    found_idx = i
-                    break
-            if found_idx is not None:
-                m = msgs.pop(found_idx)
-                msgs.insert(1, m)
-            else:
-                msgs.insert(1, SystemMessage(content=upload_placeholder))
-
-        self.lc_messages = msgs
+        msgs = [m for m in (self.lc_messages or []) if isinstance(m, BaseMessage)]
+        self.lc_messages = self._apply_instruction_and_upload_headers(msgs, self.lang)
         self._attach_stats_msg_idx = 1
 
     def _close_unfinished_tool_calls_in_lc_messages(self) -> None:
@@ -1716,6 +1715,10 @@ class ChatSession:
         sess.history = list(data.get("history") or [])
         sess.chat_model_key = str(data.get("chat_model_key") or sess.chat_model_key)
         sess.vlm_model_key = str(data.get("vlm_model_key") or sess.vlm_model_key)
+        try:
+            sess.sent_media_total = int(data.get("sent_media_total", 0) or 0)
+        except Exception:
+            sess.sent_media_total = 0
         sess.load_media = cls._deserialize_load_media(data.get("load_media"))
 
         pending_ids = [str(x) for x in (data.get("pending_media_ids") or [])]
@@ -2038,6 +2041,7 @@ class ChatSession:
                 "media_count": len(self.load_media),
                 "pending_count": len(self.pending_media_ids),
                 "inflight_uploads": len(self.resumable_uploads),
+                "sent_media_total": int(getattr(self, "sent_media_total", 0) or 0),
             },
             "chat_model_key": self.chat_model_key,
             "chat_models": self.chat_models,
@@ -2228,10 +2232,19 @@ class SessionStore:
         if not _is_valid_session_id_hex(sid):
             return None
 
-        try:
-            restored = ChatSession.load_from_state(sid, self.cfg)
-        except SessionStateUnavailableError:
-            raise
+        restored: Optional[ChatSession] = None
+        delay = 0.05
+        for attempt in range(3):
+            try:
+                restored = ChatSession.load_from_state(sid, self.cfg)
+                break
+            except SessionStateUnavailableError as e:
+                reason = str(e.args[0]) if e.args else ""
+                if attempt < 2 and reason == "read_error":
+                    await asyncio.sleep(delay)
+                    delay *= 2.5
+                    continue
+                raise
         if restored is None:
             return None
         try:
