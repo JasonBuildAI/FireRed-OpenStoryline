@@ -3224,6 +3224,11 @@ async def ws_chat(ws: WebSocket, session_id: str):
 
                         new_messages: List[BaseMessage] = []
 
+                        # Guard first: sanitize protocol on sess.lc_messages before we build
+                        # the merged request list for astream.
+                        # This ensures astream always receives the sanitized structure.
+                        sess._sanitize_tool_protocol_in_lc_messages()
+
                         # Merge multiple SystemMessages into one to support LLMs
                         # that do not allow more than one system message.
                         _system_parts: List[str] = []
@@ -3242,9 +3247,6 @@ async def ws_chat(ws: WebSocket, session_id: str):
                         async def pump_agent():
                             nonlocal new_messages
                             try:
-                                # Guard: ensure the messages list won't violate tool protocol after restore.
-                                # This prevents provider-side 400 like: "Messages with role 'tool' must be a response..."
-                                sess._sanitize_tool_protocol_in_lc_messages()
                                 stream = sess.agent.astream(
                                     {"messages": _merged_messages},
                                     context=sess.client_context,
